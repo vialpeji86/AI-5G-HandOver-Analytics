@@ -3,6 +3,10 @@
 Local-first 5G handover intelligence for engineers who need to identify failed,
 long-distance, and potentially overshooting source–target relations quickly.
 
+
+<img width="1680" height="1050" alt="image" src="https://github.com/user-attachments/assets/afe73c05-cb50-4306-8091-c73117f61205" />
+
+
 > **Privacy:** every file committed under `data/` is simulated. The repository contains no
 > production DU identifiers, customer site names, or operational coordinates.
 
