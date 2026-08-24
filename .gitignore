@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+tmp/
+
+# Virtual environments and IDE files
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Generated reports and maps
+outputs/
+*.kmz
+
+# Private or production datasets: samples are explicitly allowlisted below
+/DU_Locations.csv
+data/private/
+data/production/
+data/raw/
+data/*
+!data/sample_du_locations.csv
+!data/sample_ho_relations.csv
+
+# Common data exports that must be reviewed before publishing
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.sqlite
+*.db
