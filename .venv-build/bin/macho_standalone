@@ -1,0 +1,6 @@
+#!/Users/victorperez/Documents/python2024/AI-5G-HandOver-Analytics/.venv-build/bin/python
+import sys
+from macholib.macho_standalone import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

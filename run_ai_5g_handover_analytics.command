@@ -9,13 +9,13 @@ if [ ! -d ".venv" ]; then
   python3 -m venv .venv
 fi
 
-source .venv/bin/activate
+PYTHON="$APP_DIR/.venv/bin/python"
 
-if ! python -c "import pandas, numpy, openpyxl, tkinterdnd2" >/dev/null 2>&1; then
+if ! "$PYTHON" -c "import pandas, numpy, openpyxl" >/dev/null 2>&1; then
   echo "[Setup] Installing required packages..."
-  pip install -U pip
-  pip install -e .
+  "$PYTHON" -m pip install -U pip
+  "$PYTHON" -m pip install -e .
 fi
 
 echo "[Run] Starting AI-5G-HandOver-Analytics..."
-python main.py
+exec "$PYTHON" main.py

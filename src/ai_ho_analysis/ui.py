@@ -3,6 +3,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
 import webbrowser
 
@@ -14,15 +15,11 @@ from .data_loader import SUPPORTED_EXT, load_many
 from .exporter import export_professional_xlsx
 from .map_analysis import MAP_PROFILES, build_profile_map_html, export_profile_kmz
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
 
-    DND_AVAILABLE = True
-except Exception:
-    DND_AVAILABLE = False
-    DND_FILES = None
-    TkinterDnD = None
-
+def _default_output_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path.home() / "Documents" / "AI-5G-HandOver-Analytics" / "outputs"
+    return Path(__file__).resolve().parents[2] / "outputs"
 
 class HOApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -527,7 +524,7 @@ class HOApp:
             return
         profile = self.map_profile_var.get().strip()
         try:
-            out_dir = Path(__file__).resolve().parents[2] / "outputs"
+            out_dir = _default_output_dir()
             out = build_profile_map_html(
                 self.analyzer.last_result.relation_detail,
                 profile_name=profile,
@@ -742,6 +739,6 @@ class HOApp:
 
 
 def run_app() -> None:
-    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
+    root = tk.Tk()
     app = HOApp(root)
     root.mainloop()
