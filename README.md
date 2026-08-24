@@ -46,6 +46,7 @@ AI-5G-HandOver-Analytics/
 ├── pyproject.toml
 └── README.md
 ```
+<img width="1680" height="1050" alt="image" src="https://github.com/user-attachments/assets/51aae3d4-2e83-4747-9489-c7eeb2ad099b" />
 
 ## Quick start
 
