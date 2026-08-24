@@ -10,10 +10,16 @@ tmp/
 
 # Virtual environments and IDE files
 .venv/
+.venv-build/
 venv/
 .idea/
 .vscode/
 .DS_Store
+.pyinstaller-cache/
+
+# PyInstaller build outputs
+/build/
+/dist/
 
 # Generated reports and maps
 outputs/
