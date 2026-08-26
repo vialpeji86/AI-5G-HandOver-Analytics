@@ -1,3 +1,4 @@
 numpy>=1.24
+ollama>=0.5
 openpyxl>=3.1
 pandas>=2.0

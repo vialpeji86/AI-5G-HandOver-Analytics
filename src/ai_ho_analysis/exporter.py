@@ -34,7 +34,10 @@ def export_professional_xlsx(sheets: Dict[str, pd.DataFrame], out_path: str | Pa
 
             headers = [ws.cell(row=1, column=i).value for i in range(1, max_col + 1)]
             pct_cols = [
-                i for i, h in enumerate(headers, start=1) if isinstance(h, str) and ("Rate" in h or "%" in h or "Coverage" in h)
+                i
+                for i, h in enumerate(headers, start=1)
+                if isinstance(h, str)
+                and ("Rate" in h or "%" in h or "Coverage" in h or "Share" in h)
             ]
             dist_cols = [i for i, h in enumerate(headers, start=1) if isinstance(h, str) and "Distance" in h]
 

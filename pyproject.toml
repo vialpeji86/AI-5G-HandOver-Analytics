@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-5g-handover-analytics"
-version = "1.0.0"
+version = "1.2.0"
 description = "Local-first 5G handover relation, distance, failure, and overshooting analysis."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.24",
+  "ollama>=0.5",
   "openpyxl>=3.1",
   "pandas>=2.0",
 ]

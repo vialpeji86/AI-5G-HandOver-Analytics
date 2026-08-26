@@ -11,7 +11,7 @@ fi
 
 PYTHON="$APP_DIR/.venv/bin/python"
 
-if ! "$PYTHON" -c "import pandas, numpy, openpyxl" >/dev/null 2>&1; then
+if ! "$PYTHON" -c "import pandas, numpy, ollama, openpyxl" >/dev/null 2>&1; then
   echo "[Setup] Installing required packages..."
   "$PYTHON" -m pip install -U pip
   "$PYTHON" -m pip install -e .

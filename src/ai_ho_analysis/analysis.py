@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
 from .configuration import AnalysisConfig
 from .models import AnalysisResult
+from .schema_inference import HOSchemaMapping, apply_ho_mapping, infer_ho_schema
 
 
 class HOAnalyzer:
@@ -17,13 +18,17 @@ class HOAnalyzer:
         self.config = config or AnalysisConfig()
         self.ho_df: Optional[pd.DataFrame] = None
         self.map_df: Optional[pd.DataFrame] = None
+        self.ho_mapping: Optional[HOSchemaMapping] = None
         self.last_result: Optional[AnalysisResult] = None
 
-    def set_ho_data(self, df: pd.DataFrame) -> None:
+    def set_ho_data(self, df: pd.DataFrame, mapping: Optional[HOSchemaMapping] = None) -> None:
         self.ho_df = df.copy()
+        self.ho_mapping = mapping
+        self.last_result = None
 
     def set_map_data(self, df: pd.DataFrame) -> None:
         self.map_df = df.copy()
+        self.last_result = None
 
     def upsert_manual_location(self, du_full: int, lat: float, lon: float) -> None:
         """Insert or update one manual DU location (11-digit GNB+DU)."""
@@ -102,16 +107,368 @@ class HOAnalyzer:
         a = np.sin(dlat / 2) ** 2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
         return 2 * r * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
+    @staticmethod
+    def _identifier_series(df: pd.DataFrame, columns: list[str], fallback: str) -> pd.Series:
+        usable = [column for column in columns if column in df.columns]
+        if not usable:
+            return pd.Series([fallback] * len(df), index=df.index, dtype="string")
+        parts = [df[column].astype("string").fillna("").str.strip() for column in usable]
+        result = parts[0]
+        for part in parts[1:]:
+            result = result.str.cat(part, sep="|")
+        return result.str.strip("|").replace("", fallback)
+
+    def _build_failure_views(
+        self,
+        detail: pd.DataFrame,
+        failure_columns: list[str],
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        failure_columns = [column for column in failure_columns if column in detail.columns]
+        identity_columns = [
+            column
+            for column in (
+                "Source_ID",
+                "Source_Site",
+                "Target_ID",
+                "Target_Site",
+                "Date_Start",
+                "Date_End",
+                "Observed_Days",
+                "Attempts",
+                "Failures",
+                "Fail_Rate",
+                "Distance_km",
+            )
+            if column in detail.columns
+        ]
+        if not failure_columns:
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty
+
+        failure_detail = detail.melt(
+            id_vars=identity_columns,
+            value_vars=failure_columns,
+            var_name="Failure_Type",
+            value_name="Failure_Count",
+        )
+        failure_detail["Failure_Count"] = pd.to_numeric(
+            failure_detail["Failure_Count"], errors="coerce"
+        ).fillna(0)
+        failure_detail = failure_detail[failure_detail["Failure_Count"] > 0].sort_values(
+            ["Failure_Count", "Failures"], ascending=[False, False]
+        )
+
+        if failure_detail.empty:
+            empty = pd.DataFrame()
+            return empty, failure_detail, empty, empty
+
+        total_failures = float(failure_detail["Failure_Count"].sum())
+        failure_types = (
+            failure_detail.groupby("Failure_Type", as_index=False)
+            .agg(
+                Total_Failures=("Failure_Count", "sum"),
+                Affected_Relations=("Failure_Count", "size"),
+                Affected_Sources=("Source_ID", "nunique"),
+                Affected_Targets=("Target_ID", "nunique"),
+            )
+            .sort_values("Total_Failures", ascending=False)
+        )
+        failure_types["Failure_Share"] = np.where(
+            total_failures > 0,
+            failure_types["Total_Failures"] / total_failures,
+            np.nan,
+        )
+
+        def offender_view(group_column: str, peer_column: str, site_column: str) -> pd.DataFrame:
+            aggregation: dict[str, tuple[str, Any]] = {
+                "Total_Failures": ("Failures", "sum"),
+                "Relations": (peer_column, "size"),
+                "Unique_Peers": (peer_column, "nunique"),
+            }
+            if "Attempts" in detail.columns:
+                aggregation["Attempts"] = ("Attempts", "sum")
+            if site_column in detail.columns:
+                aggregation[site_column] = (site_column, "first")
+            offenders = detail.groupby(group_column, as_index=False).agg(**aggregation)
+            if "Attempts" in offenders.columns:
+                offenders["Fail_Rate"] = np.where(
+                    offenders["Attempts"] > 0,
+                    offenders["Total_Failures"] / offenders["Attempts"],
+                    np.nan,
+                )
+
+            by_type = (
+                failure_detail.groupby([group_column, "Failure_Type"], as_index=False)[
+                    "Failure_Count"
+                ]
+                .sum()
+                .sort_values("Failure_Count", ascending=False)
+            )
+            dominant = by_type.drop_duplicates(group_column).rename(
+                columns={
+                    "Failure_Type": "Dominant_Failure_Type",
+                    "Failure_Count": "Dominant_Failure_Count",
+                }
+            )
+            type_count = (
+                by_type.groupby(group_column, as_index=False)["Failure_Type"]
+                .nunique()
+                .rename(columns={"Failure_Type": "Failure_Type_Count"})
+            )
+            offenders = offenders.merge(dominant, on=group_column, how="left").merge(
+                type_count, on=group_column, how="left"
+            )
+            return offenders.sort_values(
+                ["Total_Failures", "Unique_Peers"], ascending=[False, False]
+            )
+
+        source_offenders = offender_view("Source_ID", "Target_ID", "Source_Site")
+        target_offenders = offender_view("Target_ID", "Source_ID", "Target_Site")
+        return failure_types, failure_detail, source_offenders, target_offenders
+
+    def _generic_map_coordinates(self, relation: pd.DataFrame) -> pd.DataFrame:
+        relation = relation.copy()
+        for column in ("src_lat", "src_lon", "tgt_lat", "tgt_lon"):
+            relation[column] = np.nan
+        if self.map_df is None or self.map_df.empty:
+            return relation
+
+        mp = self.map_df.copy()
+        lower = {str(column).casefold(): column for column in mp.columns}
+        lat_col = next((lower[key] for key in ("lat", "latitude") if key in lower), None)
+        lon_col = next((lower[key] for key in ("lon", "longitude", "lng") if key in lower), None)
+        id_col = next(
+            (
+                lower[key]
+                for key in ("du", "gnbduid", "cell_id", "cellid", "site_name", "site")
+                if key in lower
+            ),
+            None,
+        )
+        if not (id_col and lat_col and lon_col):
+            return relation
+
+        def normalized_id(series: pd.Series) -> pd.Series:
+            return series.astype("string").fillna("").str.replace(r"\W", "", regex=True).str.upper()
+
+        lookup = pd.DataFrame(
+            {
+                "__ID": normalized_id(mp[id_col]),
+                "__Lat": pd.to_numeric(mp[lat_col], errors="coerce"),
+                "__Lon": pd.to_numeric(mp[lon_col], errors="coerce"),
+            }
+        ).dropna(subset=["__Lat", "__Lon"])
+        lookup = lookup[lookup["__ID"] != ""].drop_duplicates("__ID", keep=False)
+        src_lookup = lookup.rename(
+            columns={"__ID": "__Source_Key", "__Lat": "src_lat_map", "__Lon": "src_lon_map"}
+        )
+        tgt_lookup = lookup.rename(
+            columns={"__ID": "__Target_Key", "__Lat": "tgt_lat_map", "__Lon": "tgt_lon_map"}
+        )
+        relation["__Source_Key"] = normalized_id(relation["Source_ID"])
+        relation["__Target_Key"] = normalized_id(relation["Target_ID"])
+        relation = relation.merge(src_lookup, on="__Source_Key", how="left").merge(
+            tgt_lookup, on="__Target_Key", how="left"
+        )
+        relation["src_lat"] = relation["src_lat_map"]
+        relation["src_lon"] = relation["src_lon_map"]
+        relation["tgt_lat"] = relation["tgt_lat_map"]
+        relation["tgt_lon"] = relation["tgt_lon_map"]
+        return relation.drop(
+            columns=[
+                "__Source_Key",
+                "__Target_Key",
+                "src_lat_map",
+                "src_lon_map",
+                "tgt_lat_map",
+                "tgt_lon_map",
+            ]
+        )
+
+    def _run_generic(self, ho: pd.DataFrame, mapping: HOSchemaMapping) -> AnalysisResult:
+        prepared = apply_ho_mapping(ho, mapping)
+        prepared = prepared[(prepared["__Source_ID"] != "") & (prepared["__Target_ID"] != "")]
+        if prepared.empty:
+            raise ValueError("No rows contain both mapped Source and Target values.")
+
+        prepared["Failures"] = prepared[mapping.failure_columns].sum(axis=1)
+        if mapping.source_cell:
+            prepared["__Source_ID"] = self._identifier_series(
+                prepared, [mapping.source, mapping.source_cell], "UNKNOWN_SOURCE"
+            )
+        if mapping.target_cell:
+            prepared["__Target_ID"] = self._identifier_series(
+                prepared, [mapping.target, mapping.target_cell], "UNKNOWN_TARGET"
+            )
+        group_columns = ["__Source_ID", "__Target_ID"]
+        known_dimensions = {
+            "GNB": "Source_GNB",
+            "DU": "Source_DU",
+            "SECTOR": "Source_Sector",
+            "CARRIER": "Source_Carrier",
+            "TGTGNB": "Target_GNB",
+            "TGTDU": "Target_DU",
+            "TGTSECTOR": "Target_Sector",
+            "TGTCARRIER": "Target_Carrier",
+            "ENODEB": "Source_ENODEB",
+            "EUTRANCELL": "Source_Cell",
+            "ENODEB_TARGET": "Target_ENODEB",
+            "CELL_TARGET": "Target_Cell",
+            "NEIGHBORCELL": "Neighbor_Cell",
+        }
+        for original, canonical in known_dimensions.items():
+            if original in prepared.columns:
+                prepared[canonical] = prepared[original]
+                group_columns.append(canonical)
+        if {"GNB", "DU"}.issubset(prepared.columns):
+            prepared["__Source_ID"] = self._identifier_series(
+                prepared, ["GNB", "DU"], "UNKNOWN_SOURCE"
+            )
+        if {"TGTGNB", "TGTDU"}.issubset(prepared.columns):
+            prepared["__Target_ID"] = self._identifier_series(
+                prepared, ["TGTGNB", "TGTDU"], "UNKNOWN_TARGET"
+            )
+        if {"ENODEB", "EUTRANCELL"}.issubset(prepared.columns):
+            prepared["__Source_ID"] = self._identifier_series(
+                prepared, ["ENODEB", "EUTRANCELL"], "UNKNOWN_SOURCE"
+            )
+        if {"ENODEB_TARGET", "CELL_TARGET"}.issubset(prepared.columns):
+            prepared["__Target_ID"] = self._identifier_series(
+                prepared, ["ENODEB_TARGET", "CELL_TARGET"], "UNKNOWN_TARGET"
+            )
+        optional_mapping = {
+            "source_site": "Source_Site",
+            "target_site": "Target_Site",
+            "source_cell": "Source_Cell",
+            "target_cell": "Target_Cell",
+        }
+        for role, canonical in optional_mapping.items():
+            original = getattr(mapping, role)
+            if original:
+                prepared[canonical] = prepared[original].astype("string")
+                if canonical not in group_columns:
+                    group_columns.append(canonical)
+
+        numeric_columns = [*mapping.failure_columns, "Failures"]
+        if mapping.attempts:
+            numeric_columns.append("__Attempts")
+        if mapping.success:
+            numeric_columns.append("__Success")
+        relation = prepared.groupby(group_columns, dropna=False, as_index=False)[numeric_columns].sum()
+        if mapping.date:
+            date_summary = (
+                prepared.groupby(group_columns, dropna=False, as_index=False)["__Date"]
+                .agg(["min", "max", "nunique"])
+                .reset_index()
+                .rename(
+                    columns={
+                        "min": "Date_Start",
+                        "max": "Date_End",
+                        "nunique": "Observed_Days",
+                    }
+                )
+            )
+            relation = relation.merge(date_summary, on=group_columns, how="left")
+        relation = relation.rename(
+            columns={
+                "__Source_ID": "Source_ID",
+                "__Target_ID": "Target_ID",
+                "__Attempts": "Attempts",
+                "__Success": "Success",
+            }
+        )
+        if "Attempts" not in relation.columns:
+            relation["Attempts"] = np.nan
+        if "Success" not in relation.columns:
+            relation["Success"] = np.nan
+        relation["Fail_Rate"] = np.where(
+            relation["Attempts"] > 0,
+            relation["Failures"] / relation["Attempts"],
+            np.nan,
+        )
+        relation["Success_Rate"] = np.where(
+            relation["Attempts"] > 0,
+            relation["Success"] / relation["Attempts"],
+            np.nan,
+        )
+        relation = self._generic_map_coordinates(relation)
+        mask = relation[["src_lat", "src_lon", "tgt_lat", "tgt_lon"]].notna().all(axis=1)
+        relation["Distance_km"] = np.nan
+        relation.loc[mask, "Distance_km"] = self._haversine_km(
+            relation.loc[mask, "src_lat"].to_numpy(float),
+            relation.loc[mask, "src_lon"].to_numpy(float),
+            relation.loc[mask, "tgt_lat"].to_numpy(float),
+            relation.loc[mask, "tgt_lon"].to_numpy(float),
+        )
+        relation["Distance_Band"] = pd.cut(
+            relation["Distance_km"],
+            bins=[-0.001, 1, 3, 5, 10, np.inf],
+            labels=["0-1km", "1-3km", "3-5km", "5-10km", ">10km"],
+        )
+        relation = relation.sort_values(["Failures", "Attempts"], ascending=[False, False])
+
+        mapped = relation[relation["Distance_km"].notna()].copy()
+        missing_target = relation[relation["tgt_lat"].isna() | relation["tgt_lon"].isna()].copy()
+        total_attempts = pd.to_numeric(relation["Attempts"], errors="coerce").sum(min_count=1)
+        total_failures = float(relation["Failures"].sum())
+        summary = pd.DataFrame(
+            [
+                ["Total HO Relations", len(relation)],
+                ["Mapped Relations", len(mapped)],
+                ["Mapped Coverage", len(mapped) / len(relation) if len(relation) else np.nan],
+                ["Relations Missing Target Location", len(missing_target)],
+                ["Total Attempts", total_attempts],
+                ["Total Failures", total_failures],
+                [
+                    "Global Fail Rate",
+                    total_failures / total_attempts
+                    if pd.notna(total_attempts) and total_attempts > 0
+                    else np.nan,
+                ],
+                ["Detected Failure Types", len(mapping.failure_columns)],
+            ],
+            columns=["KPI", "Value"],
+        )
+        top_failures = relation.head(self.config.top_relations)
+        long_relations = relation[relation["Distance_km"] > self.config.long_handover_km]
+        distance_bands = (
+            mapped.groupby("Distance_Band", observed=False, as_index=False)
+            .agg(Relations=("Failures", "size"), Failures=("Failures", "sum"))
+            .sort_values("Distance_Band")
+        )
+        long_ho_table = relation[relation["Distance_km"] >= self.config.review_handover_km]
+        failure_types, failure_detail, source_offenders, target_offenders = (
+            self._build_failure_views(relation, mapping.failure_columns)
+        )
+        result = AnalysisResult(
+            summary=summary,
+            relation_detail=relation,
+            top_failures=top_failures,
+            long_relations=long_relations,
+            distance_bands=distance_bands,
+            missing_target_locations=missing_target,
+            long_ho_table=long_ho_table,
+            failure_types=failure_types,
+            failure_detail=failure_detail,
+            source_offenders=source_offenders,
+            target_offenders=target_offenders,
+        )
+        self.last_result = result
+        return result
+
     def run(self) -> AnalysisResult:
         if self.ho_df is None:
             raise ValueError("HO dataset is not loaded.")
-        if self.map_df is None:
-            raise ValueError("Coordinates dataset is not loaded.")
 
         ho = self.ho_df.copy()
+        required = ["DU", "SECTOR", "CARRIER", "TGTDU", "TGTSECTOR", "TGTCARRIER"]
+        has_structured_schema = all(column in ho.columns for column in required)
+        if not has_structured_schema or self.map_df is None:
+            mapping = self.ho_mapping or infer_ho_schema(ho).mapping
+            return self._run_generic(ho, mapping)
+
         mp = self.map_df.copy()
 
-        required = ["DU", "SECTOR", "CARRIER", "TGTDU", "TGTSECTOR", "TGTCARRIER"]
         missing = [c for c in required if c not in ho.columns]
         if missing:
             raise ValueError(f"HO file is missing required columns: {missing}")
@@ -142,11 +499,25 @@ class HOAnalyzer:
             dims.append("GNB")
         if "TGTGNB" in ho.columns:
             dims.append("TGTGNB")
-        relation = ho.groupby(dims, as_index=False).agg(
-            Attempts=("Attempts", "sum"),
-            Success=("Success", "sum"),
-            Failures=("Failures", "sum"),
-        )
+        relation_value_columns = ["Attempts", "Success", *fail_cols]
+        relation = ho.groupby(dims, as_index=False)[relation_value_columns].sum()
+        relation["Failures"] = relation[fail_cols].sum(axis=1) if fail_cols else 0
+        date_col = self._pick_col(ho, ["DAY", "DATE", "Date", "Timestamp"])
+        if date_col:
+            ho["__Date"] = pd.to_datetime(ho[date_col], errors="coerce")
+            date_summary = (
+                ho.groupby(dims, dropna=False, as_index=False)["__Date"]
+                .agg(["min", "max", "nunique"])
+                .reset_index()
+                .rename(
+                    columns={
+                        "min": "Date_Start",
+                        "max": "Date_End",
+                        "nunique": "Observed_Days",
+                    }
+                )
+            )
+            relation = relation.merge(date_summary, on=dims, how="left")
 
         relation["Fail_Rate"] = np.where(
             relation["Attempts"] > 0, relation["Failures"] / relation["Attempts"], np.nan
@@ -427,7 +798,18 @@ class HOAnalyzer:
                 "TGTCARRIER": "Target_Carrier",
             }
         )
+        merged["Source_ID"] = self._identifier_series(
+            merged,
+            ["Source_GNB", "Source_DU"],
+            "UNKNOWN_SOURCE",
+        )
+        merged["Target_ID"] = self._identifier_series(
+            merged,
+            ["Target_GNB", "Target_DU"],
+            "UNKNOWN_TARGET",
+        )
         ordered_cols = [
+            "Source_ID",
             "Source_Site",
             "Source_GNB",
             "Source_DU",
@@ -435,6 +817,7 @@ class HOAnalyzer:
             "Source_Carrier",
             "src_lat",
             "src_lon",
+            "Target_ID",
             "Target_Site",
             "Target_GNB",
             "Target_DU",
@@ -444,6 +827,9 @@ class HOAnalyzer:
             "tgt_lon",
             "Distance_km",
             "Distance_Band",
+            "Date_Start",
+            "Date_End",
+            "Observed_Days",
             "Attempts",
             "Success",
             "Failures",
@@ -564,6 +950,10 @@ class HOAnalyzer:
             ["Attempts", "Failures", "Distance_km"], ascending=[False, False, False]
         )
 
+        failure_types, failure_detail, source_offenders, target_offenders = (
+            self._build_failure_views(merged, fail_cols)
+        )
+
         result = AnalysisResult(
             summary=summary,
             relation_detail=merged,
@@ -572,6 +962,10 @@ class HOAnalyzer:
             distance_bands=distance_bands,
             missing_target_locations=missing_target_locations,
             long_ho_table=long_ho_table,
+            failure_types=failure_types,
+            failure_detail=failure_detail,
+            source_offenders=source_offenders,
+            target_offenders=target_offenders,
         )
         self.last_result = result
         return result
@@ -586,5 +980,9 @@ class HOAnalyzer:
             "Long_HO_Table_5kmPlus": self.last_result.long_ho_table,
             "Distance_Bands": self.last_result.distance_bands,
             "Missing_Target_Locations": self.last_result.missing_target_locations,
+            "Failure_Types": self.last_result.failure_types,
+            "Failure_Detail": self.last_result.failure_detail,
+            "Source_Offenders": self.last_result.source_offenders,
+            "Target_Offenders": self.last_result.target_offenders,
             "Source_Target_Detail": self.last_result.relation_detail,
         }

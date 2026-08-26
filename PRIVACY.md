@@ -1,7 +1,11 @@
 # Data Privacy
 
 AI-5G-HandOver-Analytics is local-first. Input KPI files, DU identifiers, coordinates, and generated
-reports are processed on the user's computer and are not transmitted by the application.
+reports are processed on the user's computer. By default, AI requests go only to Ollama at
+`127.0.0.1`; the application sends the user's prompt and bounded tool-result rows to that local
+service, never the original input files. If `AI_HO_OLLAMA_HOST` is changed to a remote address,
+those prompts and tool results will be transmitted to the configured host. Keep the default local
+host for production network data.
 
 ## Repository data policy
 

@@ -18,6 +18,8 @@ class MapProfile:
     metric: str
     long_only: bool = False
     min_attempts: int = 0
+    min_failures: int = 0
+    min_distance_km: float = 0.0
 
 
 MAP_PROFILES: Dict[str, MapProfile] = {
@@ -32,16 +34,25 @@ MAP_PROFILES: Dict[str, MapProfile] = {
 }
 
 
-def _apply_profile(df: pd.DataFrame, profile_name: str) -> pd.DataFrame:
-    if profile_name not in MAP_PROFILES:
+def _apply_profile(
+    df: pd.DataFrame,
+    profile_name: str,
+    custom_profile: MapProfile | None = None,
+) -> pd.DataFrame:
+    if custom_profile is None and profile_name not in MAP_PROFILES:
         raise ValueError(f"Unknown map profile: {profile_name}")
-    p = MAP_PROFILES[profile_name]
+    p = custom_profile or MAP_PROFILES[profile_name]
     out = df.copy()
     out = out[out["src_lat"].notna() & out["src_lon"].notna() & out["tgt_lat"].notna() & out["tgt_lon"].notna()]
-    if p.long_only:
-        out = out[out["Distance_km"] >= 5]
+    minimum_distance = max(5.0 if p.long_only else 0.0, p.min_distance_km)
+    if minimum_distance > 0 and "Distance_km" in out.columns:
+        out = out[pd.to_numeric(out["Distance_km"], errors="coerce") >= minimum_distance]
     if p.min_attempts > 0 and "Attempts" in out.columns:
         out = out[pd.to_numeric(out["Attempts"], errors="coerce").fillna(0) >= p.min_attempts]
+    if p.min_failures > 0 and "Failures" in out.columns:
+        out = out[pd.to_numeric(out["Failures"], errors="coerce").fillna(0) >= p.min_failures]
+    if p.metric not in out.columns:
+        raise ValueError(f"Map metric is not available in this dataset: {p.metric}")
     out = out.sort_values(p.metric, ascending=False, na_position="last").head(p.top_n).copy()
     out["Rank"] = np.arange(1, len(out) + 1)
     return out
@@ -112,16 +123,19 @@ def build_profile_map_html(
     relation_detail: pd.DataFrame,
     profile_name: str,
     out_html: str | Path,
+    custom_profile: MapProfile | None = None,
 ) -> Path:
-    selected = _apply_profile(relation_detail, profile_name)
+    selected = _apply_profile(relation_detail, profile_name, custom_profile)
     if selected.empty:
         raise ValueError("No rows available for this map profile.")
 
-    source_group = selected.groupby(["Source_DU", "src_lat", "src_lon"], as_index=False)["Attempts"].sum()
+    source_key = "Source_DU" if "Source_DU" in selected.columns else "Source_ID"
+    source_group = selected.groupby([source_key, "src_lat", "src_lon"], as_index=False)["Attempts"].sum()
     src_row = source_group.sort_values("Attempts", ascending=False).iloc[0]
     center_lat = float(src_row["src_lat"])
     center_lon = float(src_row["src_lon"])
-    source_du_center = str(int(src_row["Source_DU"])) if pd.notna(src_row["Source_DU"]) else "N/A"
+    source_value = src_row[source_key]
+    source_du_center = str(source_value) if pd.notna(source_value) else "N/A"
 
     features = []
     for _, r in selected.iterrows():
@@ -356,3 +370,31 @@ def build_profile_map_html(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html_doc, encoding="utf-8")
     return out
+
+
+def build_custom_map_html(
+    relation_detail: pd.DataFrame,
+    out_html: str | Path,
+    *,
+    title: str = "AI Custom HO Map",
+    top_n: int = 50,
+    metric: str = "Failures",
+    min_distance_km: float = 0.0,
+    min_failures: int = 0,
+    min_attempts: int = 0,
+) -> Path:
+    """Create a filtered map requested through the local AI assistant."""
+    profile = MapProfile(
+        name=title,
+        top_n=max(1, min(2000, int(top_n))),
+        metric=metric,
+        min_distance_km=max(0.0, float(min_distance_km)),
+        min_failures=max(0, int(min_failures)),
+        min_attempts=max(0, int(min_attempts)),
+    )
+    return build_profile_map_html(
+        relation_detail,
+        title,
+        out_html,
+        custom_profile=profile,
+    )

@@ -15,6 +15,11 @@ class KPIDef:
 
 
 KPI_DEFS: List[KPIDef] = [
+    KPIDef("CoverageHole", "Vendor MRO event counter", "LTE/NR Mobility", "Mobility Robustness", "Failure", "Mobility event associated with a possible coverage gap; validate with radio measurements before concluding that a physical coverage hole exists."),
+    KPIDef("TooEarlyHoFailure", "Vendor MRO event counter", "LTE/NR Mobility", "Mobility Robustness", "Failure", "Handover-related failure classified as too early, typically requiring correlation with return/re-establishment behavior and serving/target radio conditions."),
+    KPIDef("TooLateHoRlfBeforeTriggering", "Vendor MRO event counter", "LTE/NR Mobility", "Mobility Robustness", "Failure", "Radio link failure occurred before the configured handover trigger, indicating that mobility action may have started too late or radio degradation was too rapid."),
+    KPIDef("TooLateHoRlfAfterTriggering", "Vendor MRO event counter", "LTE/NR Mobility", "Mobility Robustness", "Failure", "Radio link failure occurred after the handover trigger but before successful completion; correlate execution timing, signaling, and radio quality."),
+    KPIDef("PingpongHandover", "Vendor MRO event counter", "LTE/NR Mobility", "Mobility Robustness", "Failure", "Repeated handover behavior between cells within a short interval; validate dominance overlap, hysteresis, time-to-trigger, and load steering."),
     KPIDef("EndcIntraChgPrepFail_MenbFail_per_GNB", "S5NC_INTRA_SN_PSCEL_CHG_GNB:ENDCINTRACHGPREPFAI_MENBFAIGNB", "Intra", "Prep", "Failure", "Preparation failure caused by MeNB-side issue before HO execution."),
     KPIDef("EndcIntraChgFail_DuTimeout_per_GNB", "S5NC_INTRA_SN_PSCEL_CHG_GNB:ENDCINTRACHGFAIL_DUTIMEOUT_GNB", "Intra", "Exec", "Failure", "Execution failure due to DU timeout during HO procedure."),
     KPIDef("EndcIntraChgPrepSucc_per_GNB", "S5NC_INTRA_SN_PSCEL_CHG_GNB:ENDCINTRACHGPREPSUCC_GNB", "Intra", "Prep", "Success", "Successful HO preparation at source side before final execution."),
@@ -48,6 +53,47 @@ KPI_DEFS: List[KPIDef] = [
 ]
 
 KPI_INDEX: Dict[str, KPIDef] = {k.name.lower(): k for k in KPI_DEFS}
+
+
+def failure_recommended_checks(kpi_name: str) -> str:
+    """Return bounded engineering checks inferred from a known failure-counter name."""
+    name = kpi_name.casefold()
+    checks: list[str] = []
+    if "coveragehole" in name:
+        checks.append(
+            "Validate RSRP/RSRQ/SINR, coverage plots, antenna configuration, overshooting, and missing neighbors"
+        )
+    if "tooearly" in name:
+        checks.append(
+            "Review return-to-source/wrong-cell evidence, hysteresis, time-to-trigger, offsets, and radio dominance"
+        )
+    if "toolate" in name:
+        checks.append(
+            "Review pre-trigger radio degradation, A3/A5 thresholds, time-to-trigger, coverage, and RLF timing"
+        )
+    if "pingpong" in name:
+        checks.append(
+            "Check overlapping dominance, hysteresis, time-to-trigger, CIO/offset symmetry, and load balancing"
+        )
+    if "prep" in name:
+        checks.append("Validate preparation signaling, target admission, and preparation timers")
+    if "dutimeout" in name or "uptimeout" in name or "rrcto" in name:
+        checks.append("Correlate timer expiry with message timestamps and late responses")
+    if "du" in name:
+        checks.append("Review DU alarms, processing load, software events, and resource admission")
+    if "cpfail" in name:
+        checks.append("Check Xn-C/SCTP reachability, packet loss, latency, and signaling sequence")
+    if "upfail" in name or "uptimeout" in name:
+        checks.append("Check Xn-U/GTP-U tunnel setup, transport loss, latency, and UP capacity")
+    if "menbfail" in name:
+        checks.append("Inspect source MeNB context, configuration consistency, and correlated alarms")
+    if "rrcto" in name:
+        checks.append("Correlate radio quality, interference, RLF/re-establishment, and UE traces")
+    if "tdcoverall" in name:
+        checks.append("Review overall procedure timing, completion signaling, and context release")
+    if not checks:
+        checks.append("Correlate the counter with vendor documentation, traces, load, and alarms")
+    return "; ".join(dict.fromkeys(checks)) + "."
 
 
 def find_kpi_matches(query: str) -> List[KPIDef]:

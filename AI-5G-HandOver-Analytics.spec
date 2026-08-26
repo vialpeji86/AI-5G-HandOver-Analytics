@@ -47,5 +47,5 @@ app = BUNDLE(
     name='AI-5G-HandOver-Analytics.app',
     icon=None,
     bundle_identifier='com.victorperez.ai5ghandoveranalytics',
-    version='1.0.0',
+    version='1.2.0',
 )
